@@ -1,5 +1,6 @@
-import { Task } from './store';
-import { generateOllamaResponse, OllamaMessage } from './ollama';
+import { Task, Persona } from './store';
+import { aiAdapter } from './ai/adapter';
+import { AIMessage } from './ai/types';
 
 export type ResponseType = 'CHAT' | 'TASK' | 'MEMORY';
 
@@ -12,10 +13,15 @@ export interface AIResponse {
 export const processInput = async (
     input: string,
     userName: string,
-    aiName: string,
-    history: { role: 'user' | 'ai'; text: string }[] = []
+    activePersona: string | Persona, // Accept either string (legacy/fallback) or Persona object
+    history: { role: 'user' | 'ai'; text: string }[] = [],
+    selectedModel: string = 'ollama-llama3.2'
 ): Promise<AIResponse> => {
     const lowercaseInput = input.toLowerCase();
+
+    // Resolve persona details
+    const aiName = typeof activePersona === 'string' ? activePersona : activePersona.name;
+    const personaObj = typeof activePersona === 'string' ? null : activePersona;
 
     // 1. Intent Parsing: Delete/Remove Tasks (Priority)
     if (
@@ -43,7 +49,7 @@ export const processInput = async (
         const taskTitle = input.replace(/remind me to |schedule |buy |todo |wake me up at |alarm for |add /gi, '').trim();
         return {
             type: 'TASK',
-            text: `Of course, ${userName}. I've added "${taskTitle || input}" to your list. — ${aiName}`,
+            text: `Of course, ${userName}. I've added "${taskTitle || input}" to your list.`,
             data: { action: 'create', title: taskTitle || input }
         };
     }
@@ -78,16 +84,46 @@ export const processInput = async (
     if (greetings.some(g => lowercaseInput === g || lowercaseInput.startsWith(g + ' '))) {
         return {
             type: 'CHAT',
-            text: `Hello ${userName}! How can I help you today? — ${aiName}`
+            text: `Hello ${userName}! How can I help you today?`
         };
     }
 
-    // 6. Fallback to Ollama for complex/knowledge queries
-    const ollamaHistory: OllamaMessage[] = [
+    // 6. Fallback to AI Adapter for complex/knowledge queries
+
+    // Construct System Prompt based on Persona
+    let systemPrompt = '';
+
+    if (personaObj && personaObj.systemPrompt) {
+        // Use custom system prompt if available
+        systemPrompt = personaObj.systemPrompt;
+
+        // Append user name instruction if not present
+        if (!systemPrompt.includes(userName)) {
+            systemPrompt += `\n\nAlways address the user as ${userName}.`;
+        }
+    } else {
+        // Default system prompt builder based on relationship mode
+        const relationshipMode = personaObj?.relationshipMode || 'Strict Professional';
+
+        systemPrompt = `You are ${aiName}, a loyal, supportive, and intelligent AI companion to ${userName}.
+Relationship Mode: ${relationshipMode}.
+
+Keep your responses concise, friendly, and helpful. Always address the user as ${userName}.`;
+    }
+
+    // Add Formatting Instructions (Universal)
+    systemPrompt += `\n\nIMPORTANT: Format your responses using Markdown:
+- Use **bold** for emphasis
+- Use \`code\` for inline code or technical terms
+- Use code blocks with language specification for code examples (e.g., \`\`\`python)
+- Use bullet points or numbered lists when explaining multiple items
+- Use headings (##) to organize longer responses
+- Keep responses well-structured and easy to read`;
+
+    const messages: AIMessage[] = [
         {
             role: 'system',
-            content: `You are ${aiName}, a loyal, supportive, and intelligent AI companion to ${userName}.
-      Keep your responses concise, friendly, and helpful. Always address the user as ${userName}.`
+            content: systemPrompt
         },
         ...history.map(h => ({
             role: h.role === 'user' ? 'user' as const : 'assistant' as const,
@@ -97,15 +133,16 @@ export const processInput = async (
     ];
 
     try {
-        const llmResponse = await generateOllamaResponse(ollamaHistory);
+        const response = await aiAdapter.generateResponse(selectedModel, messages);
         return {
             type: 'CHAT',
-            text: llmResponse
+            text: response.content
         };
-    } catch (error) {
+    } catch (error: any) {
+        console.error('AI generation error:', error);
         return {
             type: 'CHAT',
-            text: `I understand, ${userName}. Tell me more about that. — ${aiName}`
+            text: `I'm having trouble connecting to my AI brain. ${error.message || 'Please check your configuration.'}`
         };
     }
 };
